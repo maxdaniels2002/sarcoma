@@ -1,0 +1,1167 @@
+---
+title: "R Markdown Compiling computational analysis"
+output: html_document
+date: "2025-02-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This document provides the complete computational methodology used to analyze sarcoma tumor samples, focusing on:
+
+Mutation profile analysis using dNdScv Tumor proliferation scoring and classification Survival analysis between tumor subtypes Differential gene expression analysis Pathway enrichment analysis. All analyses were performed in R version 4.2.0 using the packages specified below.
+
+## Mutation profile analysis with dNdScv
+
+```{r dndscv}
+### Data loading and analysis
+# Read in the TCGA data:
+info <- read.delim("sarcoma_pan/data_mutations.txt")
+
+# Select the columns that are relevant for dNdSCV analysis:
+mutations <- info[,c("Tumor_Sample_Barcode","Chromosome","Start_Position",
+                     "Reference_Allele","Tumor_Seq_Allele2")]
+
+# Rename columns:
+colnames(mutations) <- c("sampleID","chr","pos","ref","mut")
+
+### dndscv
+library("dndscv")
+dndsout <- dndscv(mutations)
+
+#### table of significant genes
+sel_cv = dndsout$sel_cv
+signif_genes = sel_cv[sel_cv$qglobal_cv<0.1, ]
+rownames(signif_genes)=NULL
+signif_genes
+
+##plot
+library(ggplot2)
+library(ggpubr)
+library(tidyr)
+library(ggrepel)
+# Prepare data for plotting
+signif_genes_long <- signif_genes %>%
+  pivot_longer(cols = c("wind_cv", "wspl_cv", "wnon_cv", "wmis_cv"), 
+               names_to = "mutation_type", 
+               values_to = "cv_value") %>%
+  mutate(mutation_type = factor(mutation_type,
+                               levels = c("wmis_cv", "wnon_cv", "wspl_cv", "wind_cv"),
+                               labels = c("Missense", "Nonsense", "Splice-site", "Indels")))
+
+
+ggplot(signif_genes_long, aes(x = cv_value, y = qallsubs_cv)) +
+  geom_point(aes(color = mutation_type), size = 3) + 
+  geom_text_repel(aes(label = gene_name), size = 3) +
+  facet_wrap(~ mutation_type) +  
+  labs(x = "Mutation Coefficients (CV)", y = "All Substitutions CV", title = "Comparison of Mutation Types vs Substitution CV") +
+  theme_minimal() +
+  theme(legend.position = "none") 
+
+```
+
+## Calculate proliferation scores for tumours
+
+Subset tumours into Slow Growing and Aggressive
+
+```{r proliferation}
+library(readxl)
+
+### Read in the expression data:
+expr <- read.delim("sarcoma_pan/data_mrna_seq_v2_rsem_zscores_ref_all_samples.txt")
+#remove duplicates
+expr <- expr[!duplicated(expr$Hugo_Symbol), ]
+#remove first two colums 
+matrix.expr <- expr[,-c(1:2)]
+#name each row with gene name
+rownames(matrix.expr) <- expr$Hugo_Symbol
+#transform - switch rows and colums 
+matrix.expr <- t(matrix.expr)
+#make data.frame
+matrix.expr <- data.frame(matrix.expr)
+#add sample names
+matrix.expr$SampleID <- rownames(matrix.expr)
+
+#### Read the proliferation signature:
+prolif <- read_excel("G0arrest_signature.xlsx")
+upreg <- prolif[which(prolif$Expression == "upregulated"),]$Gene
+downreg <- prolif[which(prolif$Expression == "downregulated"),]$Gene
+
+# Score upregulated genes in G0:
+matrix.expr$UpregulatedG0 <- apply(matrix.expr[,which(colnames(matrix.expr) %in% upreg)], 1, function(x) mean(x))
+matrix.expr$DownregulatedG0 <- apply(matrix.expr[,which(colnames(matrix.expr) %in% downreg)], 1, function(x) mean(x))
+matrix.expr$G0score <- matrix.expr$UpregulatedG0-matrix.expr$DownregulatedG0
+matrix.expr$ProliferationScore <- (-1)*matrix.expr$G0score
+
+
+# histogram of the prolif score distribution:
+hist(matrix.expr$ProliferationScore)
+
+matrix.expr$ProliferationState <- sapply(matrix.expr$ProliferationScore,
+                                         function(x) ifelse(x>0,"Aggressive" ,"SlowGrowing"))
+# how many:
+table(matrix.expr$ProliferationState)
+
+
+aggressive_samples <- matrix.expr[matrix.expr$ProliferationState == "Aggressive", ]
+aggressive_samples <- row.names(aggressive_samples)
+
+SlowGrowing_samples <- matrix.expr[matrix.expr$ProliferationState == "SlowGrowing", ]
+SlowGrowing_samples <- row.names(SlowGrowing_samples)
+
+# Convert row names to match mutation file format
+aggressive_samples <- gsub("\\.", "-", row.names(matrix.expr[matrix.expr$ProliferationState == "Aggressive", ]))
+slowgrowing_samples <- gsub("\\.", "-", row.names(matrix.expr[matrix.expr$ProliferationState == "SlowGrowing", ]))
+
+# Read mutation data
+info <- read.delim("sarcoma_pan/data_mutations.txt")
+
+# Subset info where Tumor_Sample_Barcode is in aggressive_samples
+agg_sub <- info[info$Tumor_Sample_Barcode %in% aggressive_samples, ]
+slow_sub <- info[info$Tumor_Sample_Barcode %in% slowgrowing_samples, ]
+```
+
+## Survival analysis
+
+One way we can look at if our hypothesised "Aggressive" and "Slow Growing" tumours differ is by plotting overall survival and disease free progression over time.
+
+```{r survminer}
+library("survminer")
+require("survival")
+
+slow <- read.delim("sarcoma_pan/PanSlowGrowing_Mutations.txt")
+fast <- read.delim("sarcoma_pan/PanAggressive_Mutations.txt")
+
+surv <- read.delim("sarcoma_pan/KM_Plot__Overall_(months).txt")
+
+surv$OS_STATUS <- ifelse(grepl("DECEASED", surv$OS_STATUS), 1, 0)
+
+
+slow$Tumor_Sample_Barcode <- substr(slow$Tumor_Sample_Barcode, 1, nchar(slow$Tumor_Sample_Barcode) - 3)
+fast$Tumor_Sample_Barcode <- substr(fast$Tumor_Sample_Barcode, 1, nchar(fast$Tumor_Sample_Barcode) - 3)
+
+slow_sub <- surv[surv$Patient.ID %in% slow$Tumor_Sample_Barcode, ]
+agg_sub <- surv[surv$Patient.ID %in% fast$Tumor_Sample_Barcode, ]
+
+agg_sub$Group <- "Aggressive"
+slow_sub$Group <- "Slow-growing"
+
+# Combine both datasets
+combined_df <- rbind(agg_sub, slow_sub)
+
+fit <- survfit(Surv(OS_MONTHS, OS_STATUS) ~ Group, data = combined_df)
+
+ggsurvplot( fit, data = combined_df, pval = TRUE, conf.int = TRUE, xlim = c(0,200), xlab = "Time in months", break.time.by = 12, ggtheme = theme_light(), risk.table=TRUE, risk.table.fontsize=3)
+
+
+###Disease free
+slow <- read.delim("sarcoma_pan/PanSlowGrowing_Mutations.txt")
+agg <- read.delim("sarcoma_pan/PanAggressive_Mutations.txt")
+surv <- read.delim("sarcoma_pan/KM_Plot__Disease_Free_(months).txt")
+
+surv$DFS_STATUS <- ifelse(grepl("Recurred/Progressed", surv$DFS_STATUS), 1, 0)
+
+slow$Tumor_Sample_Barcode <- substr(slow$Tumor_Sample_Barcode, 1, nchar(slow$Tumor_Sample_Barcode) - 3)
+agg$Tumor_Sample_Barcode <- substr(agg$Tumor_Sample_Barcode, 1, nchar(agg$Tumor_Sample_Barcode) - 3)
+
+slow_sub <- surv[surv$Patient.ID %in% slow$Tumor_Sample_Barcode, ]
+agg_sub <- surv[surv$Patient.ID %in% agg$Tumor_Sample_Barcode, ]
+
+agg_sub$Group <- "Aggressive"
+slow_sub$Group <- "Slow-growing"
+
+# Combine both datasets
+combined_df <- rbind(agg_sub, slow_sub)
+
+fit <- survfit(Surv(DFS_MONTHS, DFS_STATUS) ~ Group, data = combined_df)
+
+ggsurvplot( fit, data = combined_df, pval = TRUE, conf.int = TRUE, xlim = c(0,200), xlab = "Time in months", ylab = "Percentage without recurrence/progression", break.time.by = 12, ggtheme = theme_light(), risk.table=TRUE, risk.table.fontsize=3)
+
+
+```
+
+## dndscv analysis by subtype
+
+Now that we have subsetted aggressive and slow growing tumours we can run dndscv on them seperately to see if they have different significant genes.
+
+```{r dndscv on slow growing and aggressive tumours}
+## dndcsv on fast vs slow
+##sarcoma_pan slow
+info <- read.delim("sarcoma_pan/PanSlowGrowing_Mutations.txt")
+mutations <- info[,c("Tumor_Sample_Barcode", "Chromosome", "Start_Position", "Reference_Allele", "Tumor_Seq_Allele2")]
+colnames(mutations) <- c("sampleID", "chr", "pos", "ref", "mut")
+
+library("dndscv")
+dndsout <- dndscv(mutations)
+sel_cv <- dndsout$sel_cv
+
+Slowsignif_genes = sel_cv[sel_cv$qglobal_cv<0.1, ]
+rownames(Slowsignif_genes)=NULL
+Slowsignif_genes
+
+##plot
+library(ggplot2)
+library(ggpubr)
+library(tidyr)
+library(ggrepel)
+
+Slowsignif_genes_long <- Slowsignif_genes %>%
+  pivot_longer(cols = c("wind_cv", "wspl_cv", "wnon_cv", "wmis_cv"), 
+               names_to = "mutation_type", 
+               values_to = "cv_value") %>%
+mutate(
+       mutation_type = factor(mutation_type,
+                              levels = c("wmis_cv", "wnon_cv", "wspl_cv", "wind_cv"),
+                              labels = c("Missense", "Nonsense", "Splice-site", "Indels")))
+
+
+ggplot(Slowsignif_genes_long, aes(x = cv_value, y = qallsubs_cv)) +
+  geom_point(aes(color = mutation_type), size = 3) +  # Adjust size if necessary
+  geom_text_repel(aes(label = gene_name), size = 3) +
+  facet_wrap(~ mutation_type) +  # This will create separate subplots for each mutation type
+  labs(x = "Mutation Coefficients (CV)", y = "All Substitution CV)", title = "Comparison of Mutation Types vs Substitution CV in Slow Growing tumours") +
+  theme_minimal() +
+  theme(legend.position = "none") 
+
+##sarcomaPan aggressive
+info <- read.delim("sarcoma_pan/PanAggressive_Mutations.txt")
+mutations <- info[,c("Tumor_Sample_Barcode", "Chromosome", "Start_Position", "Reference_Allele", "Tumor_Seq_Allele2")]
+colnames(mutations) <- c("sampleID", "chr", "pos", "ref", "mut")
+
+dndsout <- dndscv(mutations)
+sel_cv <- dndsout$sel_cv
+
+Aggsignif_genes = sel_cv[sel_cv$qglobal_cv<0.1, ]
+rownames(Aggsignif_genes)=NULL
+Aggsignif_genes
+
+##plot
+Aggsignif_genes_long <- Aggsignif_genes %>%
+  pivot_longer(cols = c("wind_cv", "wspl_cv", "wnon_cv", "wmis_cv"),
+               names_to = "mutation_type", 
+               values_to = "cv_value") %>%
+mutate(
+       mutation_type = factor(mutation_type,
+                              levels = c("wmis_cv", "wnon_cv", "wspl_cv", "wind_cv"),
+                              labels = c("Missense", "Nonsense", "Splice-site", "Indels")))
+
+
+
+ggplot(Aggsignif_genes_long, aes(x = cv_value, y = qallsubs_cv)) +
+  geom_point(aes(color = mutation_type), size = 3) +  # Adjust size if necessary
+  geom_text_repel(aes(label = gene_name), size = 3) +
+  facet_wrap(~ mutation_type) +  # This will create separate subplots for each mutation type
+  labs(x = "Mutation Coefficients (CV)", y = "All Substitution CV)", title = "Comparison of Mutation Types vs Substitution CV in aggressive tumours") +
+  theme_minimal() +
+  theme(legend.position = "none")  
+```
+
+## Maf tools
+
+We can now run maftools to visualise...
+
+```{r maf plots}
+
+library(maftools)
+
+fast <- read.maf(maf = "sarcoma_pan/PanAggressive_Mutations.txt")
+slow <- read.maf(maf = "sarcoma_pan/PanSlowGrowing_Mutations.txt")
+
+
+plotmafSummary(maf = fast, rmOutlier = TRUE, addStat = 'median', dashboard = TRUE, titvRaw = FALSE)
+plotmafSummary(maf = slow, rmOutlier = TRUE, addStat = 'median', dashboard = TRUE, titvRaw = FALSE)
+
+
+rainfallPlot(maf = fast, detectChangePoints = TRUE, pointSize = 0.4)
+rainfallPlot(maf = slow, detectChangePoints = TRUE, pointSize = 0.4)
+
+somaticInteractions(maf = fast, top = 25, pvalue = c(0.05, 0.1))
+somaticInteractions(maf = slow, top = 25, pvalue = c(0.05, 0.1))
+
+### compare two cohorts
+fastVsSlow <- mafCompare(m1 = fast, m2 = slow, m1Name = 'Aggressive', m2Name = 'SlowGrowing')
+
+forestPlot(mafCompareRes = fastVsSlow, pVal = 0.1)
+
+
+```
+
+# Differential gene expression analysis
+
+```{r expression, fig.show='all'}
+#### Adult diff exp
+gset <- read.delim("sarcoma_pan/data_mrna_seq_v2_rsem.txt")
+
+# The ENSEMBL gene IDs will not be necessary for subsequent analyses.
+gset <- gset[!duplicated(gset$Hugo_Symbol), ]
+exp <- gset[,-c(1:2)]
+rownames(exp) <- gset$Hugo_Symbol
+exp <- round(exp)
+
+slow <- read.delim("sarcoma_pan/PanSlowGrowing_Mutations.txt")
+fast <- read.delim("sarcoma_pan/PanAggressive_Mutations.txt")
+slow$Group <- "Slow-growing"
+fast$Group <- "Aggressive"
+combine <- rbind(slow, fast)
+combine <- unique(combine[,c("Tumor_Sample_Barcode","Group")])
+combine$Tumor_Sample_Barcode <- gsub("-", "\\.", combine$Tumor_Sample_Barcode)
+
+
+library("DESeq2")
+# number of control and infected samples:
+table(combine$Group)
+# Releveling such that the control becomes the first:
+combine$Group <- factor(combine$Group)
+combine$Group <- relevel(combine$Group, "Slow-growing")
+
+# only keep samples that are in both
+combine <- combine[which(combine$Tumor_Sample_Barcode %in% colnames(exp)),]
+exp <- exp[,combine$Tumor_Sample_Barcode] 
+
+dds <- DESeqDataSetFromMatrix(countData = exp, colData = combine, design = ~ Group)
+
+# remove genes with less that 10
+dds <- dds[ rowSums(counts(dds)) > 10, ]
+
+# data transformation 
+# Variance stabilizing transformation
+vsd <- vst(dds, blind = FALSE)
+sampleDists_vsd <- dist(t(assay(vsd)))
+# transform to matrix
+sampleDistMatrix_vsd <- as.matrix( sampleDists_vsd )
+rownames(sampleDistMatrix_vsd) <- vsd$Group
+colnames(sampleDistMatrix_vsd) <- NULL
+
+# draw heatmap
+library(RColorBrewer)
+library(pheatmap)
+library(ggplot2)
+library(ggrepel)
+
+# Colors palette
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+
+# Draw heatmap
+heatmap <- pheatmap(sampleDistMatrix_vsd,
+                    clustering_distance_rows = sampleDists_vsd,
+                    clustering_distance_cols = sampleDists_vsd,
+                    col = colors,
+                    fontsize = 2)
+
+# Generate PCA plot with color and labels
+pcaData <- plotPCA(vsd, intgroup = c("Group", "Tumor_Sample_Barcode"), returnData = TRUE)
+
+
+# Update x and y labels to include variance explained
+pca <- prcomp(t(assay(vsd)))
+percentVar <- (pca$sdev^2) / sum(pca$sdev^2) * 100 
+ggplot(pcaData, aes(PC1, PC2, color = Group)) +
+  geom_point(size = 3) +
+  geom_text_repel(aes(label = Tumor_Sample_Barcode), size = 1) +
+  labs(title = "PCA of Samples",
+       x = paste0("PC1: ", round(percentVar[1], 1), "% Variance"),
+       y = paste0("PC2: ", round(percentVar[2], 1), "% Variance")) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+## run DESeq
+dds_DGE <- DESeq(dds)
+# results table
+dds_DGE_results <- results(dds_DGE)
+
+table(dds_DGE_results$padj < 0.05)
+
+# Select significant genes with a p adjusted lower than 0.05:
+resSig <- subset(dds_DGE_results, padj < 0.05)
+# Order significant genes by p adjusted:
+resSig <- resSig[ order(resSig$padj),]
+# Order significant genes with the strongest down-regulation:
+head(resSig[ order(resSig$log2FoldChange),])
+# strongest upreg
+head(resSig[ order(resSig$log2FoldChange, decreasing = TRUE), ])
+
+
+# histogram
+hist(dds_DGE_results$pvalue , col = "blue",  xlab = "", , border = "white", ylab = "Frequency", breaks =0:40/40, main = "frequencies of p-values")
+
+# volcano
+library("dplyr")
+
+# Add labels for significance:
+results_order <- as.data.frame(dplyr::mutate(as.data.frame(resSig), 
+                                             sig=ifelse(resSig$padj<0.05, 
+                                                        ifelse(resSig$log2FoldChange>0.5,
+                                                               "Upregulated", 
+                                                               ifelse(resSig$log2FoldChange<(-0.5),
+                                                                      "Down Regulated","Not Sig")),"Not Sig")), 
+                               row.names=rownames(resSig))
+
+library(ggrepel)
+
+# Select genes that have log2 fold change higher than 0.5 and p adjusted lower than 0.05:
+DEgenes_DESeq <- results_order[which(abs(results_order$log2FoldChange) > 0.5 & results_order$padj < 0.05),]
+DEgenes_DESeq <- DEgenes_DESeq[order(DEgenes_DESeq$padj),]
+resSig.selected <- resSig[which(rownames(resSig) %in% rownames(DEgenes_DESeq)),]
+
+# Generate the volcano plot with consistent styling
+volcano_plot <- ggplot(results_order, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = sig), alpha = 0.7, size = 1.5) +
+  scale_color_manual(values = c("Upregulated" = "#7FB7BE", 
+                                "Down Regulated" = "#BC2C1A", 
+                                "Not Sig" = "darkgrey")) +
+  theme_minimal() +
+  labs(x = "log2 Fold Change", y = "-log10(Adjusted p-value)", 
+       title = "Differential Expression Results") +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed")
+
+# Get top 10 up/down regulated significant genes (padj < 0.05)
+sig_genes <- results_order[results_order$padj < 0.05, ]
+top_up <- head(sig_genes[order(-sig_genes$log2FoldChange), ], 15)
+top_down <- head(sig_genes[order(sig_genes$log2FoldChange), ], 15)
+
+genes_to_label <- rbind(top_up, top_down)
+
+# Add gene labels to plot
+if (nrow(genes_to_label) > 0) {
+  volcano_plot <- volcano_plot + 
+    ggrepel::geom_text_repel(
+      data = genes_to_label,
+      aes(label = rownames(genes_to_label)),
+      size = 3,
+      max.overlaps = Inf,
+      box.padding = 0.5,
+      segment.color = "grey50",
+      min.segment.length = 0
+    )
+}
+
+# Print the plot
+print(volcano_plot)
+
+# Count significant genes
+upregulated_count <- sum(results_order$sig == "Upregulated", na.rm = TRUE)
+downregulated_count <- sum(results_order$sig == "Down Regulated", na.rm = TRUE)
+
+# Print the counts
+cat("Number of significantly upregulated genes (log2FC > 0.5 & padj < 0.05):", upregulated_count, "\n")
+cat("Number of significantly downregulated genes (log2FC < -0.5 & padj < 0.05):", downregulated_count, "\n")  
+
+
+```
+
+# Pathway Analysis using pathfindR
+
+```{r path analysis}
+# path analysis
+df <- data.frame(resSig[which(resSig$log2FoldChange>1),c("log2FoldChange","padj")])
+df$Gene <- rownames(df)
+df$padj <- as.numeric(df$padj)
+df$log2FoldChange <- as.numeric(df$log2FoldChange)
+
+library(pathfindR)
+
+
+# Run the analysis against the KEGG database, but other options can be selected (e.g. Reactome):
+output_df <- run_pathfindR(df[,c("Gene","log2FoldChange","padj")],gene_sets="KEGG") 
+
+enrichment_chart(output_df, top_terms = 33) +
+  scale_color_gradientn(
+    colours = c("#2C3E50", "#3498DB", "#E74C3C"))
+
+```
+
+# Single cell analysis
+
+```{r single cell analysis - slow vs aggressive}
+# Load required libraries
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(readxl)
+library(ggplot2)
+library(ggrepel)
+library(VennDiagram)
+library(ggvenn)
+library(pheatmap)
+library(tibble)
+
+# Read single-cell data
+control <- Read10X_h5("SingleCellAnalysis/GSM7719735/GSM7719735_8817_CTRL_01_filtered_feature_bc_matrix.h5")
+palbo <- Read10X_h5("SingleCellAnalysis/GSM7719735/GSM7719736_8817_Palbo_01_filtered_feature_bc_matrix.h5")
+
+# Load proliferation signature genes
+prolif <- read_excel("G0arrest_signature.xlsx")
+upreg <- prolif$Gene[prolif$Expression == "upregulated"]
+downreg <- prolif$Gene[prolif$Expression == "downregulated"]
+
+
+calculate_proliferation_scores <- function(matrix_data) {
+  df <- data.frame(t(as.matrix(matrix_data)))
+  df$SampleID <- rownames(df)
+  
+  # Calculate G0 scores
+  df$UpregulatedG0 <- rowMeans(df[, colnames(df) %in% upreg], na.rm = TRUE)
+  df$DownregulatedG0 <- rowMeans(df[, colnames(df) %in% downreg], na.rm = TRUE)
+  df$G0score <- df$UpregulatedG0 - df$DownregulatedG0
+  df$ProliferationScore <- -df$G0score
+  
+  # Classify cells based on score
+  df$ProliferationState <- ifelse(df$ProliferationScore > 0, "Aggressive", "SlowGrowing")
+  return(df)
+}
+
+# Apply scoring to both conditions
+control_df <- calculate_proliferation_scores(control)
+palbo_df <- calculate_proliferation_scores(palbo)
+
+# Visualize score distributions
+hist(control_df$ProliferationScore, main = "Control Proliferation Scores")
+hist(palbo_df$ProliferationScore, main = "Palbo Proliferation Scores")
+
+# Compare proliferation states between conditions
+state_counts <- table(
+  Condition = c(rep("Control", nrow(control_df)), rep("Palbo", nrow(palbo_df))),
+  ProliferationState = c(control_df$ProliferationState, palbo_df$ProliferationState)
+)
+
+# Plot state distribution
+ggplot(as.data.frame(state_counts), 
+       aes(x = Condition, y = Freq, fill = ProliferationState)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  ggtitle("Proliferation State Distribution") +
+  theme_minimal()
+
+# Fisher test for significance
+fisher_result <- fisher.test(state_counts)
+print(state_counts)
+print(fisher_result)
+```
+
+```{r single cell analysis - gene expression}
+
+process_seurat <- function(counts, metadata_df) {
+  seurat_obj <- CreateSeuratObject(counts = counts)
+  seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+  seurat_obj <- NormalizeData(seurat_obj)
+  seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+  seurat_obj <- ScaleData(seurat_obj, features = VariableFeatures(seurat_obj))
+  seurat_obj <- seurat_obj[, match(metadata_df$SampleID, colnames(seurat_obj))]
+  seurat_obj$ProliferationState <- metadata_df$ProliferationState
+  seurat_obj$Condition <- ifelse(grepl("CTRL", colnames(seurat_obj)), "Control", "Palbo")
+  
+  return(seurat_obj)
+}
+
+# Process both conditions
+control_seurat <- process_seurat(control, control_df)
+palbo_seurat <- process_seurat(palbo, palbo_df)
+
+
+# Run PCA and UMAP for each condition
+control_seurat <- RunPCA(control_seurat, features = VariableFeatures(control_seurat))
+control_seurat <- RunUMAP(control_seurat, dims = 1:20)
+
+palbo_seurat <- RunPCA(palbo_seurat, features = VariableFeatures(palbo_seurat))
+palbo_seurat <- RunUMAP(palbo_seurat, dims = 1:20)
+
+# Prepare combined UMAP data
+umap_data <- rbind(
+  data.frame(
+    UMAP1 = Embeddings(control_seurat, "umap")[,1],
+    UMAP2 = Embeddings(control_seurat, "umap")[,2],
+    Condition = "Control",
+    ProliferationState = control_seurat$ProliferationState,
+    CellID = colnames(control_seurat)
+  ),
+  data.frame(
+    UMAP1 = Embeddings(palbo_seurat, "umap")[,1],
+    UMAP2 = Embeddings(palbo_seurat, "umap")[,2],
+    Condition = "Palbo",
+    ProliferationState = palbo_seurat$ProliferationState,
+    CellID = colnames(palbo_seurat)
+  )
+)
+umap_data$CombinedState <- paste(umap_data$Condition, umap_data$ProliferationState, sep = " | ")
+
+# Visualization parameters
+state_colors <- c(
+  "Control | Aggressive" = "#E41A1C",
+  "Control | SlowGrowing" = "#377EB8",
+  "Palbo | Aggressive" = "#984EA3",
+  "Palbo | SlowGrowing" = "#4DAF4A"
+)
+condition_shapes <- c("Control" = 16, "Palbo" = 17)
+
+# Create combined UMAP plot
+combined_plot <- ggplot(umap_data, aes(x = UMAP1, y = UMAP2)) +
+  geom_point(aes(color = CombinedState, shape = Condition), size = 0.8, alpha = 0.6) +
+  scale_color_manual(values = state_colors) +
+  scale_shape_manual(values = condition_shapes) +
+  labs(title = "Combined UMAP: Control vs Palbo",
+       x = "UMAP 1",
+       y = "UMAP 2",
+       color = "Proliferation State",
+       shape = "Condition") +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(shape = c(16, 16, 17, 17))))
+
+print(combined_plot)
+ggsave("combined_umap_plot.png", combined_plot, width = 10, height = 8, dpi = 300)
+
+# Create separate condition plots
+control_plot <- DimPlot(control_seurat, 
+                        group.by = "ProliferationState",
+                        cols = c("Aggressive" = "#E41A1C", "SlowGrowing" = "#377EB8"),
+                        pt.size = 0.3) + 
+  ggtitle("Control Cells") +
+  theme(legend.position = "bottom")
+
+palbo_plot <- DimPlot(palbo_seurat, 
+                      group.by = "ProliferationState",
+                      cols = c("Aggressive" = "#E41A1C", "SlowGrowing" = "#377EB8"),
+                      pt.size = 0.3) + 
+  ggtitle("Palbo Cells") +
+  theme(legend.position = "bottom")
+
+# Combine plots
+(control_plot | palbo_plot) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+
+run_de_analysis <- function(seurat_obj, condition_name) {
+  de_results <- FindMarkers(
+    seurat_obj, 
+    ident.1 = "Aggressive", 
+    ident.2 = "SlowGrowing",
+    group.by = "ProliferationState",
+    min.pct = 0.25, 
+    logfc.threshold = 0.25,
+    test.use = "wilcox"  # Seurat will now use presto's optimized version
+  )
+  
+  write.table(de_results, 
+              file = paste0("DE_", condition_name, "_Aggressive_vs_SlowGrowing.txt"), 
+              sep = "\t", quote = FALSE)
+  
+  return(de_results)
+}
+
+de_control <- run_de_analysis(control_seurat, "Control")
+de_palbo <- run_de_analysis(palbo_seurat, "Palbo")
+
+
+plot_volcano <- function(de_results, title) {
+  # Convert to data frame if not already and ensure numeric columns
+  de_results <- as.data.frame(de_results)
+  
+  # Check and convert columns to numeric if needed
+  de_results$avg_log2FC <- as.numeric(as.character(de_results$avg_log2FC))
+  de_results$p_val_adj <- as.numeric(as.character(de_results$p_val_adj))
+  
+  # Handle NA values
+  de_results$p_val_adj[is.na(de_results$p_val_adj)] <- 1
+  de_results$avg_log2FC[is.na(de_results$avg_log2FC)] <- 0
+  
+  # Create significance column
+  de_results$sig <- ifelse(de_results$p_val_adj < 0.05, 
+                           ifelse(de_results$avg_log2FC > 0.5,
+                                  "Upregulated", 
+                                  ifelse(de_results$avg_log2FC < -0.5,
+                                         "Down Regulated", "Not Sig")),
+                           "Not Sig")
+  
+  # Convert to factor with consistent levels
+  de_results$sig <- factor(de_results$sig, 
+                           levels = c("Upregulated", "Down Regulated", "Not Sig"))
+  upregulated_count <- sum(de_results$sig == "Upregulated", na.rm = TRUE)
+  downregulated_count <- sum(de_results$sig == "Down Regulated", na.rm = TRUE)
+  
+  # Create the plot
+  p <- ggplot(de_results, aes(x = avg_log2FC, y = -log10(p_val_adj))) +
+    geom_point(aes(color = sig), alpha = 0.7, size = 1.5) +
+    scale_color_manual(values = c("Upregulated" = "#7FB7BE", 
+                                  "Down Regulated" = "#BC2C1A", 
+                                  "Not Sig" = "darkgrey")) +
+    ggtitle(title) +
+    theme_minimal() +
+    labs(x = "avg_log2FC", y = "-log10(Adjusted p-value)") +
+    geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed")
+  
+  # Identify top genes - first filter for significant genes (p_val_adj < 0.05)
+  sig_genes <- de_results[de_results$p_val_adj < 0.05, ]
+  top_up <- head(sig_genes[order(-sig_genes$avg_log2FC), ], 15)
+  top_down <- head(sig_genes[order(sig_genes$avg_log2FC), ], 15)
+
+  genes_to_label <- rbind(top_up, top_down)
+  
+  # Add labels if there are genes to label
+    p <- p + ggrepel::geom_text_repel(
+      data = genes_to_label,
+      aes(label = rownames(genes_to_label)),
+      size = 3,
+      max.overlaps = 50,
+      box.padding = 0.5,
+      segment.color = "grey50",
+      min.segment.length = 0
+    )
+    # Print counts to console as well
+    message("\nGene counts for: ", title)
+    message("Significantly upregulated: ", upregulated_count)
+    message("Significantly downregulated: ", downregulated_count)
+  return(p)
+}
+
+# Generate and display volcano plots
+palbo_volcano <- plot_volcano(de_palbo, "Palbociclib: Aggressive vs SlowGrowing")
+control_volcano <- plot_volcano(de_control, "Control: Aggressive vs SlowGrowing")
+print(palbo_volcano)
+print(control_volcano)
+
+
+# Venn diagram of significant genes
+venn_data <- list(
+  Control = rownames(de_control[de_control$p_val_adj < 0.05, ]),
+  Palbo = rownames(de_palbo[de_palbo$p_val_adj < 0.05, ])
+)
+
+venn_plot <- ggvenn(
+  venn_data, 
+  fill_color = c("#1b9e77", "#7570b3"),
+  stroke_size = 0.5,
+  set_name_size = 5,
+  text_size = 4
+) + ggtitle("Overlap of Significant Genes")
+
+print(venn_plot)
+
+
+# Heatmap of top genes
+# Define top genes for control and palbo separately
+control_top <- unique(c(
+  rownames(head(de_control[order(-de_control$avg_log2FC), ], 10)),
+  rownames(head(de_control[order(de_control$avg_log2FC), ], 10))
+))
+
+palbo_top <- unique(c(
+  rownames(head(de_palbo[order(-de_palbo$avg_log2FC), ], 10)),
+  rownames(head(de_palbo[order(de_palbo$avg_log2FC), ], 10))
+))
+
+# Now combine them into top_genes
+top_genes <- unique(c(control_top, palbo_top))
+# Create top genes heatmap
+expr_matrix <- cbind(
+  Control_Aggressive = AverageExpression(control_seurat, features = top_genes, 
+                                         group.by = "ProliferationState")$RNA[,"Aggressive"],
+  Palbo_Aggressive = AverageExpression(palbo_seurat, features = top_genes,
+                                       group.by = "ProliferationState")$RNA[,"Aggressive"],
+  Control_SlowGrowing = AverageExpression(control_seurat, features = top_genes,
+                                          group.by = "ProliferationState")$RNA[,"SlowGrowing"],
+  Palbo_SlowGrowing = AverageExpression(palbo_seurat, features = top_genes,
+                                        group.by = "ProliferationState")$RNA[,"SlowGrowing"]
+)
+
+gene_origin <- data.frame(
+  "Top Up/Down Regulated In" = ifelse(
+    top_genes %in% unlist(control_top) & top_genes %in% unlist(palbo_top), "Both",
+    ifelse(top_genes %in% unlist(control_top), "Control", "Palbo")
+  ),
+  row.names = top_genes
+)
+colnames(gene_origin) <- "Top Up/Down Regulated In"
+annotation_colors <- list("Top Up/Down Regulated In" = c(Control = "blue", Palbo = "red", Both = "purple"))
+
+# Scale the data row-wise (gene-wise)
+expr_matrix_scaled <- t(scale(t(expr_matrix)))
+
+pheatmap(expr_matrix_scaled, 
+         main = "Top Differentially Expressed Genes by Group", 
+         fontsize_row = 4, 
+         fontsize = 5, 
+         cellwidth = 50, 
+         annotation_row = gene_origin, 
+         annotation_colors = annotation_colors,
+         cluster_cols = FALSE, 
+         cluster_rows = TRUE)
+
+```
+
+
+
+```{r candidate genes}
+candidate_genes <- c(rownames(resSig))
+
+plot_candidate_volcano <- function(de_results, title, candidate_genes) {
+  # Convert to data frame if not already
+  de_results <- as.data.frame(de_results)
+  
+  # Check and convert columns to numeric if needed
+  de_results$avg_log2FC <- as.numeric(as.character(de_results$avg_log2FC))
+  de_results$p_val_adj <- as.numeric(as.character(de_results$p_val_adj))
+  
+  # Handle NA values
+  de_results$p_val_adj[is.na(de_results$p_val_adj)] <- 1
+  de_results$avg_log2FC[is.na(de_results$avg_log2FC)] <- 0
+  
+  # Create significance column
+  de_results$sig <- ifelse(de_results$p_val_adj < 0.05, 
+                           ifelse(de_results$avg_log2FC > 0.5,
+                                  "Upregulated", 
+                                  ifelse(de_results$avg_log2FC < -0.5,
+                                         "Down Regulated", "Not Sig")),
+                           "Not Sig")
+  
+  # Mark candidate genes
+  de_results$is_candidate <- rownames(de_results) %in% candidate_genes
+  
+  # Create the plot with consistent styling
+  p <- ggplot(de_results, aes(x = avg_log2FC, y = -log10(p_val_adj))) +
+    geom_point(aes(color = sig, alpha = is_candidate), size = 1.5) +
+    scale_color_manual(values = c("Upregulated" = "#7FB7BE", 
+                                  "Down Regulated" = "#BC2C1A", 
+                                  "Not Sig" = "darkgrey")) +
+    scale_alpha_manual(values = c(`TRUE` = 1, `FALSE` = 0.3), guide = "none") +
+    ggtitle(title) +
+    theme_minimal() +
+    labs(x = "avg_log2FC", y = "-log10(Adjusted p-value)") +
+    geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed")
+  
+  # Get significant candidate genes
+  sig_candidates <- de_results[de_results$is_candidate & de_results$p_val_adj < 0.05, ]
+  
+  # Select top 15 up/down regulated candidates if they exist
+  if(nrow(sig_candidates) > 0) {
+    top_up <- head(sig_candidates[order(-sig_candidates$avg_log2FC), ], 15)
+    top_down <- head(sig_candidates[order(sig_candidates$avg_log2FC), ], 15)
+    genes_to_label <- rbind(top_up, top_down)
+    
+    # Remove duplicates in case a gene appears in both lists
+    genes_to_label <- genes_to_label[!duplicated(rownames(genes_to_label)), ]
+    
+    # Add labels
+    if(nrow(genes_to_label) > 0) {
+      p <- p + ggrepel::geom_text_repel(
+        data = genes_to_label,
+        aes(label = rownames(genes_to_label)),
+        size = 3,
+        max.overlaps = Inf,
+        box.padding = 0.5,
+        segment.color = "grey50",
+        min.segment.length = 0
+      )
+    }
+  }
+  
+  # Calculate and print statistics
+  total_candidates <- sum(de_results$is_candidate)
+  sig_candidate_count <- nrow(sig_candidates)
+  
+  cat("\nResults for", title, ":\n")
+  cat("Total candidate genes present:", total_candidates, "\n")
+  cat("Significant candidate genes:", sig_candidate_count, "\n")
+  cat("Percentage significant:", round(sig_candidate_count/total_candidates*100, 1), "%\n")
+  
+  return(p)
+}
+
+# Generate plots
+control_volcano <- plot_candidate_volcano(de_control, "Control Condition", candidate_genes)
+palbo_volcano <- plot_candidate_volcano(de_palbo, "Palbo Condition", candidate_genes)
+
+# Display plots
+print(control_volcano)
+print(palbo_volcano)
+
+# First identify significant candidate genes in each condition
+significant_in_control <- rownames(de_control)[rownames(de_control) %in% candidate_genes & 
+                                      de_control$p_val_adj < 0.05 & 
+                                      abs(de_control$avg_log2FC) > 0.5]
+
+significant_in_palbo <- rownames(de_palbo)[rownames(de_palbo) %in% candidate_genes & 
+                                  de_palbo$p_val_adj < 0.05 & 
+                                  abs(de_palbo$avg_log2FC) > 0.5]
+
+# Find genes unique to Palbo
+palbo_unique <- setdiff(significant_in_palbo, significant_in_control)
+
+# Find genes significant in both conditions
+sig_in_both <- intersect(significant_in_control, significant_in_palbo)
+
+# Print results
+cat("Candidate genes significant in BOTH conditions (", length(sig_in_both), "):\n")
+print(sig_in_both)
+
+# Print results
+cat("Candidate genes significant ONLY in Palbo condition (", length(palbo_unique), "):\n")
+print(palbo_unique)
+
+
+
+
+# Create Venn data (named list for ggvenn)
+venn_data <- list(
+  Control = significant_in_control, 
+  Palbo = significant_in_palbo
+)
+
+# Generate Venn diagram
+venn_plot <- ggvenn(
+  venn_data,
+  fill_color = c("#1b9e77", "#7570b3"), 
+  stroke_size = 0.5, set_name_size = 5, 
+  text_size = 4) + 
+  ggtitle("Overlap of Significant Candidate Genes (Control vs. Palbo)") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))  
+# Display plot
+print(venn_plot)
+
+# Heatmap of candidate genes (row-scaled, original colors)
+control_avg <- AverageExpression(control_seurat, 
+                                 features = significant_in_control,
+                                 group.by = "ProliferationState")$RNA
+palbo_avg <- AverageExpression(palbo_seurat, 
+                               features = significant_in_palbo,
+                               group.by = "ProliferationState")$RNA
+
+expr_matrix <- cbind(
+  Control_Aggressive = control_avg[,"Aggressive"],
+  Palbo_Aggressive = palbo_avg[,"Aggressive"],
+  Control_SlowGrowing = control_avg[,"SlowGrowing"],
+  Palbo_SlowGrowing = palbo_avg[,"SlowGrowing"]
+)
+
+
+# Annotation colors (unchanged)
+annotation_colors <- list(
+  Origin = c("Control" = "blue", "Palbo" = "red", "Both" = "purple")
+)
+
+# Row-wise scaling (z-scores)
+expr_matrix_scaled <- t(scale(t(expr_matrix)))
+
+# Subset for genes significant in both conditions
+expr_matrix_both_scaled <- expr_matrix_scaled[rownames(expr_matrix_scaled) %in% sig_in_both, ]
+
+pheatmap(expr_matrix_both_scaled,
+         main = "Significant Candidate Genes in Both Control and Palbo",
+         fontsize_row = 4,
+         fontsize_col = 8,
+         cellwidth = 50,
+         annotation_colors = annotation_colors,
+         cluster_cols = FALSE)
+```
+
+```{r nichenetr on single cell}
+# Load libraries
+library(Seurat)
+library(tidyverse)
+library(nichenetr)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(pheatmap)
+
+# Load data
+ligand_target_matrix <- readRDS("~/Downloads/ligand_target_matrix_nsga2r_final.rds")
+lr_network <- readRDS("~/Downloads/lr_network_human_21122021.rds")
+weighted_networks <- readRDS("~/Downloads/weighted_networks_nsga2r_final.rds")
+
+# Create Seurat object function
+create_seurat <- function(counts, metadata, project) {
+  cell_metadata <- data.frame(
+    proliferation_state = factor(metadata$ProliferationState[match(colnames(counts), metadata$SampleID)]),
+    row.names = colnames(counts)
+  )
+  obj <- CreateSeuratObject(counts = counts, project = project, meta.data = cell_metadata)
+  obj <- NormalizeData(obj)
+  Idents(obj) <- "proliferation_state"
+  return(obj)
+}
+
+# Create Seurat objects
+ctrl_obj <- create_seurat(control, control_df, "control")
+palbo_obj <- create_seurat(palbo, palbo_df, "palbo")
+
+# Core NicheNet function
+run_nichenet <- function(seurat_obj, condition_name, sender = "Aggressive", receiver = "SlowGrowing") {
+  expressed_sender <- get_expressed_genes(sender, seurat_obj, 0.05)
+  expressed_receiver <- get_expressed_genes(receiver, seurat_obj, 0.05)
+  expressed_receptors <- intersect(unique(lr_network$to), expressed_receiver)
+  
+  markers <- FindMarkers(seurat_obj, ident.1 = receiver, ident.2 = sender,
+                         min.pct = 0.10, logfc.threshold = 0.25, only.pos = TRUE)
+  geneset <- rownames(markers)[markers$p_val_adj < 0.05 & markers$avg_log2FC > 0.5]
+  
+  background <- intersect(expressed_receiver, rownames(ligand_target_matrix))
+  potential_ligands <- lr_network %>%
+    filter(from %in% expressed_sender, to %in% expressed_receptors) %>%
+    pull(from) %>% unique()
+  
+  ligand_activities <- predict_ligand_activities(
+    geneset, background, ligand_target_matrix, potential_ligands
+  )
+  
+  top_ligands <- ligand_activities %>% arrange(-aupr_corrected) %>% slice(1:20) %>% pull(test_ligand)
+  
+  lt_links <- lapply(top_ligands, get_weighted_ligand_target_links,
+                     geneset = geneset, ligand_target_matrix = ligand_target_matrix, n = 200) %>%
+    bind_rows() %>% drop_na()
+  
+  lr_links <- get_weighted_ligand_receptor_links(
+    top_ligands, expressed_receptors, lr_network, weighted_networks$lr_sig
+  )
+  
+  return(list(
+    ligand_activities = ligand_activities,
+    markers = markers,
+    active_ligand_target_links = lt_links,
+    lr_links = lr_links,
+    expressed_ligands = potential_ligands,
+    expressed_receptors = expressed_receptors,
+    condition = condition_name
+  ))
+}
+
+# Run NicheNet
+control_res <- run_nichenet(ctrl_obj, "Control")
+palbo_res <- run_nichenet(palbo_obj, "Palbo")
+
+# Helper function for heatmaps
+make_heatmap_ggplot <- function(vis_mat, x_lab, y_lab, color = "darkorange", legend_title = "") {
+  df <- as.data.frame(as.table(vis_mat))
+  colnames(df) <- c("X", "Y", "value")
+  
+  ggplot(df, aes(x = Y, y = X, fill = value)) +
+    geom_tile() +
+    scale_fill_gradient(low = "white", high = color, name = legend_title) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.grid = element_blank()) +
+    xlab(x_lab) +
+    ylab(y_lab)
+}
+
+# Generate plots per condition
+generate_condition_plots <- function(results, condition_name) {
+  # 1. Histogram of ligand activities
+  p_hist <- ggplot(results$ligand_activities, aes(x = aupr_corrected)) +
+    geom_histogram(color = "black", fill = "darkorange") +
+    geom_vline(aes(xintercept = min(results$ligand_activities %>% top_n(30, aupr_corrected) %>% pull(aupr_corrected))),
+               color = "red", linetype = "dashed", size = 1) +
+    labs(x = "Ligand activity (AUPR)", y = "# ligands", title = paste("Ligand Activity Distribution -", condition_name)) +
+    theme_classic()
+  
+  # 2. Heatmap of top ligands
+  top_ligands <- results$ligand_activities %>% top_n(30, aupr_corrected) %>% arrange(-aupr_corrected)
+  vis_mat <- top_ligands %>%
+    column_to_rownames("test_ligand") %>%
+    select(aupr_corrected) %>% 
+    as.matrix()
+  
+  p_heatmap <- make_heatmap_ggplot(vis_mat, "Prioritized ligands", "AUPR", color = "darkorange", legend_title = "AUPR") +
+    theme(axis.text.x = element_blank()) +
+    ggtitle(paste("Top Ligands -", condition_name))
+  
+  # 3. Ligand-target network
+  active_links <- prepare_ligand_target_visualization(results$active_ligand_target_links, ligand_target_matrix, cutoff = 0.33)
+  order_ligands <- intersect(top_ligands$test_ligand, colnames(active_links)) %>% rev()
+  order_targets <- results$active_ligand_target_links$target %>% unique() %>% intersect(rownames(active_links))
+  vis_mat <- t(active_links[order_targets, order_ligands])
+  
+  p_network <- make_heatmap_ggplot(vis_mat, "Ligands", "Target genes", color = "purple", legend_title = "Regulatory potential") +
+    scale_fill_gradient2(low = "whitesmoke", high = "purple") +
+    ggtitle(paste("Ligand-Target Network -", condition_name))
+  
+  return(list(
+    hist_ligand_activity = p_hist,
+    ligand_aupr_heatmap = p_heatmap,
+    ligand_target_network = p_network
+  ))
+}
+
+
+# Generate and print plots
+control_plots <- generate_condition_plots(control_res, "Control")
+palbo_plots <- generate_condition_plots(palbo_res, "Palbo")
+
+# Print examples
+print(control_plots$ligand_target_network)
+print(palbo_plots$ligand_target_network)
+print(control_plots$ligand_aupr_heatmap)
+print(palbo_plots$ligand_aupr_heatmap)
+print(control_plots$hist_ligand_activity)
+print(palbo_plots$hist_ligand_activity)
+
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+# Function to get receptor overlap and count summary
+get_receptor_summary_df <- function(control_res, palbo_res) {
+  ctrl <- control_res$expressed_receptors
+  palbo <- palbo_res$expressed_receptors
+  
+  shared <- intersect(ctrl, palbo)
+  only_ctrl <- setdiff(ctrl, palbo)
+  only_palbo <- setdiff(palbo, ctrl)
+  
+  receptor_changes <- data.frame(
+    category = c("Control-specific", "Palbo-specific", "Shared"),
+    count = c(length(only_ctrl), length(only_palbo), length(shared))
+  )
+  
+  return(list(summary_df = receptor_changes, only_ctrl = only_ctrl, only_palbo = only_palbo))
+}
+
+# Plot receptor expression bar chart
+plot_receptor_changes <- function(receptor_summary_df) {
+  ggplot(receptor_summary_df, aes(x = category, y = count, fill = category)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = count), vjust = -0.5) +
+    labs(x = "Category", y = "Number of receptors", title = "Receptor Expression Changes") +
+    scale_fill_brewer(palette = "Set2") +
+    theme_minimal()
+}
+
+# Prepare ligand comparison dataframe
+make_ligand_comparison_df <- function(control_res, palbo_res) {
+  ctrl_df <- control_res$ligand_activities %>%
+    select(test_ligand, Control = aupr_corrected)
+  palbo_df <- palbo_res$ligand_activities %>%
+    select(test_ligand, Palbo = aupr_corrected)
+  
+  merged <- full_join(ctrl_df, palbo_df, by = "test_ligand") %>%
+    replace_na(list(Control = 0, Palbo = 0)) %>%
+    mutate(delta_aupr = Palbo - Control)
+  
+  return(merged)
+}
+
+# Plot ligand activity comparison with labels and ΔAUPR coloring
+plot_ligand_activity <- function(ligand_comparison_df) {
+  ggplot(ligand_comparison_df, aes(x = Control, y = Palbo)) +
+    geom_point(aes(color = delta_aupr), size = 3) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    scale_color_gradient2(low = "blue", mid = "gray", high = "red", midpoint = 0, name = "Δ AUPR") +
+    geom_text_repel(aes(label = test_ligand), size = 3, box.padding = 0.5, max.overlaps = 20) +
+    labs(x = "Control AUPR", y = "Palbo AUPR", title = "Ligand Activity Comparison") +
+    theme_minimal()
+}
+
+# Full function to run everything and return plots + receptor lists
+receptor_info <- get_receptor_summary_df(control_res, palbo_res)
+ligand_df <- make_ligand_comparison_df(control_res, palbo_res)
+
+p_receptor_changes <- plot_receptor_changes(receptor_info$summary_df)
+p_ligand_comparison <- plot_ligand_activity(ligand_df)
+
+print(p_receptor_changes)
+print(p_ligand_comparison)
+
+receptor_info$only_ctrl
+receptor_info$only_palbo
+
+
+```
